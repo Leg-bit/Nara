@@ -1,29 +1,79 @@
-name: Build APK
+
+name: Universal ZIP Android Builder
 on:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
   workflow_dispatch:
+permissions:
+  contents: read
 jobs:
   build:
+    name: Build All ZIP Projects
     runs-on: ubuntu-latest
-    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
-      - name: Ekstrak zip proyek
-        run: |
-          mkdir -p /tmp/proj
-          unzip -q "$(find . -maxdepth 2 -name '*.zip' | head -1)" -d /tmp/proj
-          D=$(dirname "$(find /tmp/proj -name settings.gradle.kts | head -1)")
-          echo "Proyek ada di: $D"
-          echo "PROJ=$D" >> "$GITHUB_ENV"
-      - uses: actions/setup-java@v4
-        with: { distribution: temurin, java-version: 17 }
-      - uses: gradle/actions/setup-gradle@v4
-        with: { gradle-version: "8.9" }
-      - name: Build debug APK
-        working-directory: ${{ env.PROJ }}
-        run: gradle assembleDebug --no-daemon --console=plain --stacktrace
-      - uses: actions/upload-artifact@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      - name: Setup Java
+        uses: actions/setup-java@v4
         with:
-          name: Nara-APK
-          path: ${{ env.PROJ }}/app/build/outputs/apk/debug/*.apk
+          distribution: temurin
+          java-version: '17'
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Accept Licenses
+        run: yes | sdkmanager --licenses || true
+      - name: Install SDK Tools
+        run: sdkmanager "platform-tools"
+      - name: Prepare Directories
+        run: mkdir -p extracted dist
+      - name: Extract and Build All ZIPs
+        shell: bash
+        run: |
+          shopt -s nullglob
+          found=0
+          for zip in main/*.zip; do
+            found=1
+            name="$(basename "$zip" .zip)"
+            folder="extracted/$name"
+            echo "================================"
+            echo "Extracting: $name"
+            echo "================================"
+            mkdir -p "$folder"
+            unzip -q "$zip" -d "$folder"
+            wrapper="$(find "$folder" -type f -name gradlew -print -quit)"
+            if [ -z "$wrapper" ]; then
+              echo "Gradle Wrapper not found: $name"
+              continue
+            fi
+            project="$(dirname "$wrapper")"
+            echo "Building: $name"
+            chmod +x "$wrapper"
+            if (cd "$project" && ./gradlew assembleDebug --no-daemon); then
+              count=0
+              while IFS= read -r -d '' apk; do
+                count=$((count + 1))
+                cp "$apk" "dist/${name}_${count}.apk"
+                echo "APK: ${name}_${count}.apk"
+              done < <(find "$project" -type f -path '*/build/outputs/apk/debug/*.apk' -print0)
+              if [ "$count" -eq 0 ]; then
+                echo "No APK generated: $name"
+              fi
+            else
+              echo "BUILD FAILED: $name"
+            fi
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "No ZIP files found in main/"
+            exit 1
+          fi
+          if ! compgen -G "dist/*.apk" > /dev/null; then
+            echo "No APK files were generated!"
+            exit 1
+          fi
+      - name: Upload All APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: Universal-APK-Collection
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 14
