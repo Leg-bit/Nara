@@ -1,79 +1,132 @@
+name: Build Banyak APK (armeabi-v7a)
 
-name: Universal ZIP Android Builder
 on:
+  workflow_dispatch:
   push:
     branches: [main, master]
-  workflow_dispatch:
-permissions:
-  contents: read
+
 jobs:
-  build:
-    name: Build All ZIP Projects
+  list-zips:
     runs-on: ubuntu-latest
+    outputs:
+      zips: ${{ steps.find.outputs.zips }}
     steps:
-      - name: Checkout Repository
+      - uses: actions/checkout@v4
+
+      - name: Cari semua zip
+        id: find
+        run: |
+          set -e
+          LIST=$(find . -maxdepth 2 -name "*.zip" -not -path "./.git/*" | sort | jq -R -s -c 'split("\n")[:-1]')
+          echo "Ditemukan: $LIST"
+          if [ "$LIST" = "[]" ]; then echo "Tidak ada file zip di repo"; exit 1; fi
+          echo "zips=$LIST" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: list-zips
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        zip: ${{ fromJson(needs.list-zips.outputs.zips) }}
+
+    steps:
+      - name: Checkout
         uses: actions/checkout@v4
-      - name: Setup Java
+
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: 17
+
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
-      - name: Accept Licenses
-        run: yes | sdkmanager --licenses || true
-      - name: Install SDK Tools
-        run: sdkmanager "platform-tools"
-      - name: Prepare Directories
-        run: mkdir -p extracted dist
-      - name: Extract and Build All ZIPs
-        shell: bash
+
+      - name: Unzip project
         run: |
-          shopt -s nullglob
-          found=0
-          for zip in main/*.zip; do
-            found=1
-            name="$(basename "$zip" .zip)"
-            folder="extracted/$name"
-            echo "================================"
-            echo "Extracting: $name"
-            echo "================================"
-            mkdir -p "$folder"
-            unzip -q "$zip" -d "$folder"
-            wrapper="$(find "$folder" -type f -name gradlew -print -quit)"
-            if [ -z "$wrapper" ]; then
-              echo "Gradle Wrapper not found: $name"
-              continue
-            fi
-            project="$(dirname "$wrapper")"
-            echo "Building: $name"
-            chmod +x "$wrapper"
-            if (cd "$project" && ./gradlew assembleDebug --no-daemon); then
-              count=0
-              while IFS= read -r -d '' apk; do
-                count=$((count + 1))
-                cp "$apk" "dist/${name}_${count}.apk"
-                echo "APK: ${name}_${count}.apk"
-              done < <(find "$project" -type f -path '*/build/outputs/apk/debug/*.apk' -print0)
-              if [ "$count" -eq 0 ]; then
-                echo "No APK generated: $name"
-              fi
-            else
-              echo "BUILD FAILED: $name"
-            fi
-          done
-          if [ "$found" -eq 0 ]; then
-            echo "No ZIP files found in main/"
-            exit 1
+          set -e
+          ZIP="${{ matrix.zip }}"
+          mkdir -p _src
+          echo "Using zip: $ZIP"
+          unzip -q -o "$ZIP" -d _src
+          NAME=$(basename "$ZIP" .zip | tr ' ' '_')
+          ROOT=$(find _src -maxdepth 4 \( -name settings.gradle -o -name settings.gradle.kts -o -name gradlew \) \
+                 -not -path "*/__MACOSX/*" -printf '%d %h\n' | sort -n | head -n 1 | cut -d' ' -f2-)
+          if [ -z "$ROOT" ]; then echo "Project Gradle tidak ditemukan di $ZIP"; exit 1; fi
+          echo "PROJECT_ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "APP_NAME=$NAME" >> "$GITHUB_ENV"
+          echo "Project root: $ROOT"
+          echo "App name: $NAME"
+
+      - name: Setup Gradle (jika tidak ada wrapper)
+        if: ${{ hashFiles('_src/**/gradlew') == '' }}
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Force armeabi-v7a only
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/abi.gradle <<'EOF'
+          allprojects {
+            afterEvaluate { p ->
+              def android = p.extensions.findByName('android')
+              if (android != null && p.plugins.hasPlugin('com.android.application')) {
+                android.defaultConfig.ndk.abiFilters.clear()
+                android.defaultConfig.ndk.abiFilters.add('armeabi-v7a')
+                try { android.splits.abi.enable = false } catch (ignored) {}
+              }
+            }
+          }
+          EOF
+
+      - name: Build APK
+        working-directory: ${{ env.PROJECT_ROOT }}
+        env:
+          GRADLE_OPTS: -Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx3g
+        run: |
+          set -e
+          yes | sdkmanager --licenses > /dev/null || true
+          if [ -f gradlew ]; then
+            chmod +x gradlew
+            ./gradlew assembleDebug --stacktrace --no-daemon
+          else
+            gradle assembleDebug --stacktrace --no-daemon
           fi
-          if ! compgen -G "dist/*.apk" > /dev/null; then
-            echo "No APK files were generated!"
-            exit 1
-          fi
-      - name: Upload All APKs
+
+      - name: Rename APK
+        run: |
+          set -e
+          APK=$(find "$PROJECT_ROOT" -path "*/build/outputs/apk/*" -name "*.apk" | head -n 1)
+          if [ -z "$APK" ]; then echo "APK tidak ditemukan"; exit 1; fi
+          mkdir -p _out
+          cp "$APK" "_out/${APP_NAME}.apk"
+          ls -lh _out
+
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Universal-APK-Collection
-          path: dist/*.apk
+          name: apk-${{ env.APP_NAME }}
+          path: _out/${{ env.APP_NAME }}.apk
           if-no-files-found: error
-          retention-days: 14
+
+  collect:
+    needs: build
+    if: ${{ always() && needs.build.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download semua APK
+        uses: actions/download-artifact@v4
+        with:
+          pattern: apk-*
+          path: all
+          merge-multiple: true
+
+      - name: Upload gabungan
+        uses: actions/upload-artifact@v4
+        with:
+          name: semua-apk
+          path: all/*.apk
+          if-no-files-found: ignore
